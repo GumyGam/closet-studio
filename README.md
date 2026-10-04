@@ -2,6 +2,10 @@
 
 A browser-based, parametric closet configurator built with React, TypeScript, Three.js, and React Three Fiber.
 
+## Product brief
+
+See [the product brief](docs/product-brief.md) for what we decided to build, the requested capabilities, the intended visual and interaction style, initial manufacturing assumptions, and how the current prototype compares with the broader product vision.
+
 ## Run locally
 
 ```sh
@@ -10,6 +14,10 @@ npm run dev
 ```
 
 Create a production build with `npm run build`.
+
+## GitHub Pages
+
+The app is published at <https://gumygam.github.io/closet-studio/> from the `gh-pages` branch. GitHub Pages automatically publishes that branch. To publish an updated build, run `npm run build`, copy the contents of `dist/` to the root of the `gh-pages` branch, commit, and push that branch. Vite is configured with the `/closet-studio/` project-site path.
 
 ## Project backup and restore
 
