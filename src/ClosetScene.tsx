@@ -1,9 +1,17 @@
 import { useEffect, useMemo, useRef } from 'react'
 import type { RefObject } from 'react'
 import { Canvas } from '@react-three/fiber'
-import { Grid, OrbitControls } from '@react-three/drei'
+import { ContactShadows, Grid, Html, OrbitControls } from '@react-three/drei'
+import type { OrbitControls as OrbitControlsImpl } from 'three-stdlib'
 import * as THREE from 'three'
 import type { ClosetProject, ClosetProjectPackage, PartId } from './closet'
+import { dimensionsForPart } from './lib/model'
+import { mmToM } from './lib/units'
+import { migrateHexToId, resolveFinish } from './lib/finishes'
+import type { FinishId } from './lib/finishes'
+import { getCameraPreset } from './lib/cameraPresets'
+import type { CameraPresetName } from './lib/cameraPresets'
+import { finishMaterialProps } from './lib/viewerMaterials'
 
 type Props = {
   project: ClosetProject
@@ -14,32 +22,67 @@ type Props = {
   onExport3D: (exporter: () => void) => void
 }
 
+// ---------------------------------------------------------------------------
+// NOTE: camera presets live in src/lib/cameraPresets.ts and PBR finish
+// tuning in src/lib/viewerMaterials.ts (keeps this file Fast-refresh clean).
+// App.tsx layout is untouched — the Front/Iso/Top overlay buttons below
+// are rendered inside ClosetScene only.
+// ---------------------------------------------------------------------------
+
 function Board({
-  part, size, position, grain, selected, onSelect, opacity = 1, rotation,
+  part, size, position, grainBase, baseColor, finishId, selected, onSelect, opacity = 1,
 }: {
   part: PartId
   size: [number, number, number]
   position: [number, number, number]
-  grain: THREE.Texture
+  grainBase: THREE.Texture
+  baseColor: string
+  finishId: FinishId
   selected: PartId | null
   onSelect: (part: PartId) => void
   opacity?: number
-  rotation?: [number, number, number]
 }) {
-  const material = useMemo(() => new THREE.MeshStandardMaterial({
-    color: selected === part ? '#d8a36b' : '#ffffff',
-    map: grain,
-    roughness: 0.52,
-    metalness: 0.015,
-    transparent: opacity < 1,
-    opacity,
-  }), [grain, opacity, part, selected])
+  // Clone the shared grain canvas per board so repeat can follow panel size
+  // (grain doesn't stretch on big panels) without re-rendering the canvas.
+  // Grain follows the longest edge: rotate 90° on tall panels.
+  const { material, grain } = useMemo(() => {
+    const clone = grainBase.clone()
+    clone.wrapS = THREE.RepeatWrapping
+    clone.wrapT = THREE.RepeatWrapping
+    clone.center.set(0.5, 0.5)
+    const tall = size[1] > size[0]
+    clone.rotation = tall ? Math.PI / 2 : 0
+    const along = tall ? size[1] : size[0]
+    const across = tall ? size[0] : size[1]
+    clone.repeat.set(Math.max(1, along / 0.6), Math.max(1, across / 0.6))
+    clone.needsUpdate = true
+    const pbr = finishMaterialProps(finishId)
+    const isSelected = selected === part
+    const mat = new THREE.MeshPhysicalMaterial({
+      color: new THREE.Color(baseColor).lerp(new THREE.Color('#ffffff'), 0.12),
+      map: clone,
+      roughness: pbr.roughness,
+      metalness: pbr.metalness,
+      clearcoat: pbr.clearcoat,
+      clearcoatRoughness: pbr.clearcoatRoughness,
+      transparent: opacity < 1 || pbr.transparent === true,
+      opacity: Math.min(opacity, pbr.opacity ?? 1),
+      emissive: new THREE.Color(isSelected ? '#b97c2e' : '#000000'),
+      emissiveIntensity: isSelected ? 0.38 : 0,
+    })
+    return { material: mat, grain: clone }
+  }, [grainBase, baseColor, finishId, opacity, part, selected, size])
+
+  useEffect(() => () => {
+    material.dispose()
+    grain.dispose()
+  }, [material, grain])
+
   return (
     <mesh
       castShadow
       receiveShadow
       position={position}
-      rotation={rotation}
       material={material}
       onClick={(event) => { event.stopPropagation(); onSelect(part) }}
       userData={{ part }}
@@ -76,7 +119,7 @@ function makeGrainTexture(color: string) {
   texture.colorSpace = THREE.SRGBColorSpace
   texture.wrapS = THREE.RepeatWrapping
   texture.wrapT = THREE.RepeatWrapping
-  texture.repeat.set(2, 2)
+  texture.repeat.set(1, 1)
   return texture
 }
 
@@ -86,46 +129,149 @@ function Wardrobe({ project, selectedPart, onSelectPart, groupRef }: {
   onSelectPart: (part: PartId) => void
   groupRef: RefObject<THREE.Group | null>
 }) {
-  const { width, height, depth } = project.dimensions
-  const w = width / 1000
-  const h = height / 1000
-  const d = depth / 1000
-  const thickness = 0.018
+  // Outer carcass in meters (GPU units). All part sizes come from the
+  // canonical model.ts dimensionsForPart (mm) so 3D matches the cut list:
+  // sides full-height, top/bottom fit BETWEEN sides (W-36).
+  const w = mmToM(project.dimensions.width)
+  const h = mmToM(project.dimensions.height)
+  const d = mmToM(project.dimensions.depth)
   const gap = project.assembly * 0.28
   const doorAngle = project.doorOpen ? 0.82 : 0
-  const finish = project.finish
-  const grain = useMemo(() => makeGrainTexture(finish), [finish])
-  const dimension = (part: PartId, axis: 'width' | 'height' | 'depth', fallback: number) =>
-    (project.partOverrides[part]?.[axis] ?? fallback) / 1000
+
+  const finishId = migrateHexToId(project.finish)
+  const finishDef = resolveFinish(project.finish)
+  const grainBase = useMemo(() => makeGrainTexture(finishDef.color), [finishDef.color])
+  useEffect(() => () => grainBase.dispose(), [grainBase])
+
+  // Canonical per-part mm -> per-axis meters at the GPU edge.
+  const partM = (part: PartId): [number, number, number] => {
+    const dims = dimensionsForPart(project, part)
+    return [mmToM(dims.width), mmToM(dims.height), mmToM(dims.depth)]
+  }
+  const leftM = partM('left')
+  const rightM = partM('right')
+  const topM = partM('top')
+  const bottomM = partM('bottom')
+  const backM = partM('back')
+  const shelfM = partM('shelf')
+  const doorM = partM('door')
+
+  const boardProps = { grainBase, baseColor: finishDef.color, finishId, selected: selectedPart, onSelect: onSelectPart } as const
+
+  // Fixed joinery positions (assembled + exploded offset):
+  // - sides: outer faces flush at ±W/2  → center ±(W/2 - t/2), explode outward
+  // - top/bottom: centered between sides, outer faces flush at ±H/2
+  // - back: inset 2mm from rear outer face, explode further back
+  // - shelves: front set back for door clearance, explode slightly forward
+  const sideLX = -(w / 2 - leftM[0] / 2) - gap
+  const sideRX = w / 2 - rightM[0] / 2 + gap
+  const topY = h / 2 - topM[1] / 2 + gap
+  const bottomY = -(h / 2 - bottomM[1] / 2) - gap
+  const backZ = -(d / 2 - backM[2] / 2 - mmToM(2)) - gap
+  // Shelf front sits ~2mm behind the carcass front so doors close:
+  // center = front - 2mm - shelfDepth/2 → ≈ +10.5mm for default depths.
+  const shelfZ = d / 2 - mmToM(2) - shelfM[2] / 2 + gap * 0.3
+
+  const interiorH = h - mmToM(18) * 2
   const shelfPositions = Array.from({ length: project.shelves }, (_, index) => (
-    -h / 2 + thickness + ((h - 2 * thickness) / (project.shelves + 1)) * (index + 1)
+    -h / 2 + mmToM(18) + (interiorH / (project.shelves + 1)) * (index + 1)
   ))
+
+  const doorT = doorM[2]
+  const hingeZ = d / 2 + mmToM(2) + doorT / 2 + gap * 0.6
+
   return (
     <group ref={groupRef} userData={{ formeProject: project }}>
-      <Board part="left" size={[dimension('left', 'width', 18), dimension('left', 'height', height * 1000), dimension('left', 'depth', depth * 1000)]} position={[-w / 2 - gap, 0, 0]} grain={grain} selected={selectedPart} onSelect={onSelectPart} />
-      <Board part="right" size={[dimension('right', 'width', 18), dimension('right', 'height', height * 1000), dimension('right', 'depth', depth * 1000)]} position={[w / 2 + gap, 0, 0]} grain={grain} selected={selectedPart} onSelect={onSelectPart} />
-      <Board part="top" size={[dimension('top', 'width', width * 1000), dimension('top', 'height', 18), dimension('top', 'depth', depth * 1000)]} position={[0, h / 2 + gap, 0]} grain={grain} selected={selectedPart} onSelect={onSelectPart} />
-      <Board part="bottom" size={[dimension('bottom', 'width', width * 1000), dimension('bottom', 'height', 18), dimension('bottom', 'depth', depth * 1000)]} position={[0, -h / 2 - gap, 0]} grain={grain} selected={selectedPart} onSelect={onSelectPart} />
-      <Board part="back" size={[dimension('back', 'width', width * 1000 - 36), dimension('back', 'height', height * 1000 - 36), dimension('back', 'depth', 9)]} position={[0, 0, -d / 2 + 0.006 - gap]} grain={grain} selected={selectedPart} onSelect={onSelectPart} opacity={0.94} />
+      <Board part="left" size={leftM} position={[sideLX, 0, 0]} {...boardProps} />
+      <Board part="right" size={rightM} position={[sideRX, 0, 0]} {...boardProps} />
+      <Board part="top" size={topM} position={[0, topY, 0]} {...boardProps} />
+      <Board part="bottom" size={bottomM} position={[0, bottomY, 0]} {...boardProps} />
+      <Board part="back" size={backM} position={[0, 0, backZ]} {...boardProps} opacity={0.94} />
       {shelfPositions.map((y, index) => (
-        <Board key={index} part="shelf" size={[dimension('shelf', 'width', width * 1000 - 36), dimension('shelf', 'height', 18), dimension('shelf', 'depth', depth * 1000 - 25)]} position={[0, y, gap * 0.3]} grain={grain} selected={selectedPart} onSelect={onSelectPart} />
+        <Board key={index} part="shelf" size={shelfM} position={[0, y, shelfZ]} {...boardProps} />
       ))}
-      {project.doors && [-1, 1].map((side) => (
-        <group key={side} position={[side * 0.008, 0, d / 2 + 0.012]} rotation={[0, side === -1 ? doorAngle : -doorAngle, 0]}>
-          <Board
-            part="door"
-            size={[dimension('door', 'width', width * 500 - 9), dimension('door', 'height', height * 1000 - 18), dimension('door', 'depth', 20)]}
-            position={[-side * (w / 4 - 0.009), 0, 0]}
-            grain={grain}
-            selected={selectedPart}
-            onSelect={onSelectPart}
-          />
-          <mesh position={[-side * (w / 2 - 0.025), 0, 0.013]} castShadow>
-            <sphereGeometry args={[0.009, 16, 16]} />
-            <meshStandardMaterial color="#77736d" metalness={0.72} roughness={0.28} />
-          </mesh>
-        </group>
-      ))}
+      {project.doors && ([-1, 1] as const).map((side) => {
+        // Hinge on the outer stile; door panel extends toward the center.
+        // Left hinge (side=-1) opens with -Y rotation, right with +Y.
+        const hingeX = side * (w / 2 - mmToM(2)) + side * gap * 0.4
+        const panelX = -side * (doorM[0] / 2 - mmToM(1))
+        return (
+          <group key={side} position={[hingeX, 0, hingeZ]} rotation={[0, side * doorAngle, 0]}>
+            <Board part="door" size={doorM} position={[panelX, 0, 0]} {...boardProps} />
+            <mesh position={[panelX - side * (doorM[0] / 2 - 0.025), 0, doorT / 2 + 0.004]} castShadow>
+              <sphereGeometry args={[0.009, 16, 16]} />
+              <meshStandardMaterial color="#77736d" metalness={0.72} roughness={0.28} />
+            </mesh>
+          </group>
+        )
+      })}
+    </group>
+  )
+}
+
+/** Thin dimension lines (W/H/D) drawn under/beside the carcass. */
+function DimensionLines({ project }: { project: ClosetProject }) {
+  const w = mmToM(project.dimensions.width)
+  const h = mmToM(project.dimensions.height)
+  const d = mmToM(project.dimensions.depth)
+  const { geometry, labels } = useMemo(() => {
+    const yW = -h / 2 - 0.16
+    const zW = d / 2 + 0.16
+    const xH = -w / 2 - 0.16
+    const xD = w / 2 + 0.16
+    const yD = -h / 2 - 0.16
+    const tick = 0.035
+    const pts: number[] = [
+      // Width line (front, below)
+      -w / 2, yW, zW, w / 2, yW, zW,
+      -w / 2, yW - tick, zW, -w / 2, yW + tick, zW,
+      w / 2, yW - tick, zW, w / 2, yW + tick, zW,
+      // Height line (left, front plane)
+      xH, -h / 2, zW, xH, h / 2, zW,
+      xH - tick, -h / 2, zW, xH + tick, -h / 2, zW,
+      xH - tick, h / 2, zW, xH + tick, h / 2, zW,
+      // Depth line (right, below)
+      xD, yD, -d / 2, xD, yD, d / 2,
+      xD - tick, yD, -d / 2, xD + tick, yD, -d / 2,
+      xD - tick, yD, d / 2, xD + tick, yD, d / 2,
+    ]
+    const geo = new THREE.BufferGeometry()
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3))
+    return {
+      geometry: geo,
+      labels: {
+        wPos: [0, yW, zW] as [number, number, number],
+        hPos: [xH, 0, zW] as [number, number, number],
+        dPos: [xD, yD, 0] as [number, number, number],
+      },
+    }
+  }, [w, h, d])
+  useEffect(() => () => geometry.dispose(), [geometry])
+
+  const pill: React.CSSProperties = {
+    background: 'rgba(255,255,255,0.92)',
+    border: '1px solid #cfc9bf',
+    borderRadius: 999,
+    padding: '1px 8px',
+    fontSize: 11,
+    fontWeight: 600,
+    color: '#4a453e',
+    whiteSpace: 'nowrap',
+  }
+  return (
+    <group>
+      <lineSegments geometry={geometry}>
+        <lineBasicMaterial color="#8a847c" />
+      </lineSegments>
+      <Html position={labels.wPos} center style={{ pointerEvents: 'none' }}>
+        <div style={pill}>{project.dimensions.width} mm</div>
+      </Html>
+      <Html position={labels.hPos} center style={{ pointerEvents: 'none' }}>
+        <div style={pill}>{project.dimensions.height} mm</div>
+      </Html>
+      <Html position={labels.dPos} center style={{ pointerEvents: 'none' }}>
+        <div style={pill}>{project.dimensions.depth} mm</div>
+      </Html>
     </group>
   )
 }
@@ -145,6 +291,16 @@ function notifyExportError(message: string) {
 
 export default function ClosetScene({ project, projectPackage, selectedPart, onSelectPart, onExportImage, onExport3D }: Props) {
   const groupRef = useRef<THREE.Group>(null)
+  const controlsRef = useRef<OrbitControlsImpl | null>(null)
+
+  const applyPreset = (name: CameraPresetName) => {
+    const controls = controlsRef.current
+    if (!controls) return
+    const preset = getCameraPreset(name, project.dimensions)
+    controls.object.position.set(...preset.position)
+    controls.target.set(...preset.target)
+    controls.update()
+  }
 
   useEffect(() => {
     onExport3D(() => {
@@ -216,34 +372,65 @@ export default function ClosetScene({ project, projectPackage, selectedPart, onS
     })
   }, [onExport3D, onExportImage, project, projectPackage])
 
+  const presetButton: React.CSSProperties = {
+    border: '1px solid #d8d3ca',
+    background: 'rgba(255,255,255,0.92)',
+    borderRadius: 8,
+    fontSize: 11,
+    fontWeight: 600,
+    color: '#4a453e',
+    padding: '4px 8px',
+    cursor: 'pointer',
+  }
+
   return (
-    <Canvas
-      className="closet-canvas"
-      shadows
-      dpr={[1, 1.8]}
-      camera={{ position: [3.5, 2.6, 4.4], fov: 34 }}
-      gl={{ preserveDrawingBuffer: true, antialias: true }}
-    >
-      <color attach="background" args={['#f3f1ed']} />
-      <ambientLight intensity={1.05} />
-      <hemisphereLight args={['#ffffff', '#a69d90', 1.3]} />
-      <directionalLight position={[3.5, 5, 4]} intensity={3.2} castShadow shadow-mapSize={[2048, 2048]} />
-      <directionalLight position={[-4, 2, -2]} intensity={1.2} />
-      <Wardrobe project={project} selectedPart={selectedPart} onSelectPart={onSelectPart} groupRef={groupRef} />
-      <Grid
-        position={[0, -project.dimensions.height / 2000 - 0.055, 0]}
-        args={[8, 8]}
-        cellSize={0.25}
-        cellThickness={0.55}
-        cellColor="#d3d0ca"
-        sectionSize={1}
-        sectionThickness={0.9}
-        sectionColor="#c5c0b8"
-        fadeDistance={8}
-        fadeStrength={1}
-        infiniteGrid
-      />
-      <OrbitControls makeDefault minDistance={2.2} maxDistance={8} maxPolarAngle={Math.PI / 2 + 0.08} />
-    </Canvas>
+    <div style={{ position: 'relative', width: '100%', height: '100%' }}>
+      <Canvas
+        className="closet-canvas"
+        shadows
+        frameloop="demand"
+        dpr={[1, 2]}
+        camera={{ position: [3.5, 2.6, 4.4], fov: 34 }}
+        gl={{ preserveDrawingBuffer: true, antialias: true }}
+      >
+        <color attach="background" args={['#f3f1ed']} />
+        <ambientLight intensity={0.85} />
+        <hemisphereLight args={['#ffffff', '#a69d90', 0.9]} />
+        <directionalLight position={[3.5, 5, 4]} intensity={2.8} castShadow shadow-mapSize={[1024, 1024]} />
+        <directionalLight position={[-4, 2, -2]} intensity={0.9} />
+        <Wardrobe project={project} selectedPart={selectedPart} onSelectPart={onSelectPart} groupRef={groupRef} />
+        <DimensionLines project={project} />
+        <ContactShadows
+          position={[0, -mmToM(project.dimensions.height) / 2 - 0.05, 0]}
+          opacity={0.42}
+          scale={8}
+          blur={2.2}
+          far={3}
+          resolution={512}
+          color="#4a453e"
+        />
+        <Grid
+          position={[0, -project.dimensions.height / 2000 - 0.055, 0]}
+          args={[8, 8]}
+          cellSize={0.25}
+          cellThickness={0.55}
+          cellColor="#d3d0ca"
+          sectionSize={1}
+          sectionThickness={0.9}
+          sectionColor="#c5c0b8"
+          fadeDistance={8}
+          fadeStrength={1}
+          infiniteGrid
+        />
+        <OrbitControls ref={controlsRef} makeDefault minDistance={2.2} maxDistance={8} maxPolarAngle={Math.PI / 2 + 0.08} />
+      </Canvas>
+      <div style={{ position: 'absolute', top: 10, right: 10, display: 'flex', gap: 6 }}>
+        {(['front', 'iso', 'top'] as const).map((name) => (
+          <button key={name} style={presetButton} onClick={() => applyPreset(name)} aria-label={`${name} camera view`}>
+            {name === 'front' ? 'Front' : name === 'iso' ? 'Iso' : 'Top'}
+          </button>
+        ))}
+      </div>
+    </div>
   )
 }

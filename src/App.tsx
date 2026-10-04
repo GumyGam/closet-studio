@@ -4,15 +4,41 @@ import {
   Globe2, Layers3, Ruler, SlidersHorizontal, Sparkles, TriangleAlert, Undo2, Redo2, Upload,
 } from 'lucide-react'
 import ClosetScene from './ClosetScene'
+import Plan2D from './components/Plan2D'
 import {
-  buildCutList, copyProject, DEFAULT_DIMENSIONS, dimensionsForPart, FINISHES, getWarnings, isClosetProject,
+  copyProject, DEFAULT_DIMENSIONS, FINISHES, getWarnings, isClosetProject,
   isClosetProjectPackage, partLabels,
-  type ClosetProject, type ClosetProjectPackage, type Dimensions, type Language, type PartId,
+  type ClosetProjectPackage, type Dimensions, type Language, type PartId,
 } from './closet'
+// Canonical v2-pro geometry: W-36 joinery (top/bottom 1764 at 1800W default).
+// Cut-list/PDF/CSV must use this, NOT closet.ts (full-width 36mm mismatch).
+import { BOARD_THICKNESS, BACK_THICKNESS, buildCutList, dimensionsForPart } from './lib/model'
+import type { ClosetProject } from './lib/model'
+import {
+  DOOR_VARIANTS, HANDLE_OPTIONS, MODULE_CATALOG, defaultModules,
+  doorClearanceNote, moduleDef, moduleWarnings, newModuleId,
+} from './lib/modules'
+import type { DoorVariantId, HandleId, ModuleTypeId } from './lib/modules'
+import { migrateHexToId } from './lib/finishes'
+import { hardwareCsvRows, hardwareSchedule } from './lib/hardware'
 import { translate } from './translations'
 
 const STORAGE_KEY = 'forme-closet-project-v1'
 type HistoryState = { items: ClosetProject[]; index: number }
+
+/**
+ * Fill in module/door fields for old v1 saves that predate them.
+ * Keeps `isClosetProject` backward compatible (missing fields = valid).
+ */
+function withModuleDefaults(project: ClosetProject): ClosetProject {
+  return {
+    ...project,
+    modules: project.modules ?? [],
+    doorVariant: project.doorVariant ?? (project.doors ? 'doubleHinged' : 'open'),
+    handle: project.handle ?? 'bar',
+  }
+}
+
 function defaultProject(): ClosetProject {
   return {
     format: 'forme-closet',
@@ -29,6 +55,10 @@ function defaultProject(): ClosetProject {
     assembly: 0,
     language: 'en',
     unit: 'mm',
+    // Starter interior: both fit the 1800x2200x600 default carcass.
+    modules: defaultModules(),
+    doorVariant: 'doubleHinged',
+    handle: 'bar',
   }
 }
 
@@ -37,8 +67,8 @@ function readSaved(): { project: ClosetProject; history: HistoryState } {
     const value: unknown = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? 'null')
     if (isClosetProjectPackage(value)) {
       return {
-        project: copyProject(value.project),
-        history: { items: value.history.map(copyProject), index: Math.max(0, Math.min(value.historyIndex, value.history.length - 1)) },
+        project: withModuleDefaults(copyProject(value.project)),
+        history: { items: value.history.map((item) => withModuleDefaults(copyProject(item))), index: Math.max(0, Math.min(value.historyIndex, value.history.length - 1)) },
       }
     }
   } catch (error) {
@@ -61,6 +91,21 @@ function applyChanges(project: ClosetProject, changes: Partial<ClosetProject>): 
   return { ...project, ...changes, savedAt: new Date().toISOString() }
 }
 
+// Share-link (v2): encode the full projectPackage JSON -> base64 URL hash.
+// localStorage v1 key stays untouched; hash is only read on load + written on Copy.
+function encodeShareHash(bundle: ClosetProjectPackage): string {
+  const json = JSON.stringify(bundle)
+  // Unicode-safe base64 (btoa only handles Latin1).
+  const base64 = btoa(unescape(encodeURIComponent(json)))
+  return `#p=${base64}`
+}
+
+function decodeShareHash(hash: string): unknown {
+  const base64 = hash.replace(/^#p=/, '')
+  const json = decodeURIComponent(escape(atob(base64)))
+  return JSON.parse(json) as unknown
+}
+
 function App() {
   const [initial] = useState(readSaved)
   const [project, setProject] = useState(initial.project)
@@ -74,7 +119,17 @@ function App() {
   const register3DExporter = useCallback((exporter: () => void) => setExport3D(() => exporter), [])
   const ui = translate(project.language)
   const rtl = project.language === 'he'
+  // English fallback for strings with no translate() key yet (catalog slice adds i18n).
+  const t = (key: string, fallback: string) => (translate(project.language) as Record<string, string>)[key] ?? fallback
   const warnings = getWarnings(project.dimensions, project.shelves, project.doors, project.language)
+  // Modules slice: fit checks feed the existing design-check area (no new panel).
+  const modules = project.modules ?? []
+  const doorVariant: DoorVariantId = project.doorVariant ?? (project.doors ? 'doubleHinged' : 'open')
+  const moduleNotes = moduleWarnings(modules, project.dimensions)
+  const doorNote = project.doors ? doorClearanceNote(doorVariant) : ''
+  const [selectedModuleId, setSelectedModuleId] = useState<string | null>(null)
+  const [pendingModule, setPendingModule] = useState<ModuleTypeId>('doubleHang')
+  const [planOpen, setPlanOpen] = useState(true)
   const projectPackage: ClosetProjectPackage = useMemo(() => ({
     format: 'forme-closet-package',
     version: 1,
@@ -117,6 +172,18 @@ function App() {
     })
   }
 
+  // Modules & doors actions (persist via the same updateProject + history).
+  const addModule = () => {
+    updateProject({ modules: [...modules, { id: newModuleId(), type: pendingModule }] })
+  }
+  const removeModule = (id: string) => {
+    updateProject({ modules: modules.filter((entry) => entry.id !== id) })
+    if (selectedModuleId === id) setSelectedModuleId(null)
+  }
+  const setDoorVariant = (variant: DoorVariantId) => {
+    updateProject({ doorVariant: variant, doors: variant !== 'open', doorOpen: false })
+  }
+
   const restorePackage = (value: unknown) => {
     let bundle: ClosetProjectPackage
     if (isClosetProjectPackage(value)) {
@@ -126,13 +193,31 @@ function App() {
     } else {
       throw new Error(ui.invalid)
     }
-    const restored = copyProject(bundle.project)
-    const items = bundle.history.map(copyProject)
+    const restored = withModuleDefaults(copyProject(bundle.project))
+    const items = bundle.history.map((item) => withModuleDefaults(copyProject(item)))
     if (!items.length) items.push(restored)
     setProject(restored)
     setHistory({ items, index: Math.max(0, Math.min(bundle.historyIndex, items.length - 1)) })
     setNotice(ui.restored)
   }
+
+  // Share-link restore: if URL has #p=..., decode + validate, keep v1 storage untouched.
+  // Runs once on mount; invalid hash shows the standard invalid notice.
+  useEffect(() => {
+    if (!window.location.hash.startsWith('#p=')) return
+    try {
+      const value = decodeShareHash(window.location.hash)
+      if (isClosetProjectPackage(value) || isClosetProject(value)) {
+        restorePackage(value)
+      } else {
+        throw new Error(ui.invalid)
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : ui.invalid
+      setNotice(message)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   const importFile = async (file: File) => {
     try {
@@ -197,9 +282,11 @@ function App() {
       ...projectPackage,
       production: {
         units: 'mm',
-        boardThickness: 18,
-        backThickness: 9,
-        cutList: buildCutList(project),
+        boardThickness: BOARD_THICKNESS,
+        backThickness: BACK_THICKNESS,
+        // Canonical W-36 cut list (translated names + stable finish IDs).
+        cutList: buildCutList(project, project.language),
+        hardware: hardwareSchedule(project),
         designWarnings: warnings,
         productionNote: 'Confirm hardware, edge banding, joinery, and installation clearances before manufacture.',
       },
@@ -209,8 +296,9 @@ function App() {
   }
 
   const downloadCutList = () => {
-    const rows = buildCutList(project)
-    const columns = ['part', 'quantity', 'width_mm', 'height_mm', 'depth_mm', 'material']
+    // Canonical columns: translated name + stable IDs, no hex, no qty-0 rows.
+    const rows = buildCutList(project, project.language)
+    const columns = ['part', 'partId', 'quantity', 'width_mm', 'height_mm', 'depth_mm', 'material', 'grain', 'edgeband', 'finishedVsCut'] as const
     const csv = [
       columns.join(','),
       ...rows.map((row) => columns.map((column) => {
@@ -222,11 +310,40 @@ function App() {
     setExportMenu(false)
   }
 
+  const downloadHardware = () => {
+    const rows = hardwareCsvRows(project)
+    const columns = ['item', 'sku', 'quantity'] as const
+    const csv = [
+      columns.join(','),
+      ...rows.map((row) => columns.map((column) => {
+        const value = String(row[column] ?? '')
+        return `"${value.replaceAll('"', '""')}"`
+      }).join(',')),
+    ].join('\r\n')
+    downloadFile(`\uFEFF${csv}`, 'text/csv;charset=utf-8', 'closet-hardware.csv')
+    setExportMenu(false)
+  }
+
+  const copyShareLink = async () => {
+    try {
+      const url = `${window.location.origin}${window.location.pathname}${encodeShareHash(projectPackage)}`
+      await navigator.clipboard.writeText(url)
+      // Minimal UI text: reuse the existing 'restored/saved' tone, English fallback.
+      // (translate() has no share key yet — full i18n lands with the catalog slice.)
+      setNotice(project.language === 'he' ? 'הקישור הועתק' : project.language === 'zh' ? '链接已复制' : project.language === 'es' ? 'Enlace copiado' : 'Share link copied')
+      window.history.replaceState(null, '', encodeShareHash(projectPackage))
+    } catch (error) {
+      console.error('Could not copy the share link', error)
+      setNotice(ui.invalid)
+    }
+  }
+
   const downloadDrawings = async () => {
     try {
     const { jsPDF } = await import('jspdf')
     const document = new jsPDF({ orientation: 'landscape', unit: 'mm', format: 'a4' })
     const { width, height, depth } = project.dimensions
+    const finishId = migrateHexToId(project.finish)
     const scale = Math.min(94 / width, 105 / height)
     const frontWidth = width * scale
     const frontHeight = height * scale
@@ -237,7 +354,7 @@ function App() {
     document.text('FORME · CLOSET PRODUCTION DRAWING', 16, 18)
     document.setFont('helvetica', 'normal')
     document.setFontSize(9)
-    document.text(`${width} × ${height} × ${depth} mm  |  Board: 18 mm  |  Back: 9 mm  |  Finish: ${project.finish}`, 16, 25)
+    document.text(`${width} × ${height} × ${depth} mm  |  Board: ${BOARD_THICKNESS} mm  |  Back: ${BACK_THICKNESS} mm  |  Finish: ${finishId}`, 16, 25)
     document.setFontSize(8)
     document.text('FRONT ELEVATION', frontX, 40)
     document.rect(frontX, frontY, frontWidth, frontHeight)
@@ -261,17 +378,39 @@ function App() {
     document.text('CUT LIST  ·  ALL DIMENSIONS IN MM', 185, 40)
     document.setFont('helvetica', 'normal')
     document.setFontSize(7)
-    const headings = ['Part / qty', 'W', 'H', 'D']
-    const colX = [185, 245, 261, 276]
+    // Translated headings where keys exist (dimensions/structure), else English fallback.
+    const tr = translate(project.language) as Record<string, string>
+    const headings = [
+      tr['part'] ?? tr['selected'] ?? 'Part / qty',
+      tr['width'] ?? 'W',
+      tr['height'] ?? 'H',
+      tr['depth'] ?? 'D',
+      'Finish',
+    ]
+    const colX = [185, 238, 252, 266, 279]
     headings.forEach((heading, index) => document.text(heading, colX[index], 47))
     document.line(185, 49, 290, 49)
-    const rows = buildCutList(project)
+    // Real per-part dims from model.ts (W-36 joinery), never carcass-only.
+    const rows = buildCutList(project, project.language)
+    const rowHeight = 8
+    const rowsPerPage = 7
     rows.forEach((row, index) => {
-      const y = 56 + index * 8
-      document.text(`${row.part} ×${row.quantity}`, colX[0], y)
+      // Paginate instead of overflowing: 7 rows fit page 1, extras go to page 2+.
+      if (index > 0 && index % rowsPerPage === 0) {
+        document.addPage()
+        document.setFont('helvetica', 'bold')
+        document.setFontSize(7)
+        headings.forEach((heading, headingIndex) => document.text(heading, colX[headingIndex], 20))
+        document.line(185, 22, 290, 22)
+        document.setFont('helvetica', 'normal')
+      }
+      const pageIndex = index % rowsPerPage
+      const y = (index < rowsPerPage ? 56 : 29) + pageIndex * rowHeight
+      document.text(`${row.part} ×${row.quantity}`, colX[0], y, { maxWidth: 50 })
       document.text(String(row.width_mm), colX[1], y)
       document.text(String(row.height_mm), colX[2], y)
       document.text(String(row.depth_mm), colX[3], y)
+      document.text(row.material, colX[4], y, { maxWidth: 11 })
     })
     const noteY = Math.max(169, frontY + frontHeight + 24)
     document.setFontSize(8)
@@ -344,8 +483,32 @@ function App() {
           <section className="control-section">
             <div className="section-heading"><Layers3 size={15} /><h2>{ui.structure}</h2></div>
             <div className="row-control"><div><span className="control-label">{ui.shelves}</span><small>{ui.interior}</small></div><div className="stepper"><button onClick={() => updateProject({ shelves: Math.max(0, project.shelves - 1) })} aria-label="Remove shelf">−</button><span>{project.shelves}</span><button onClick={() => updateProject({ shelves: Math.min(6, project.shelves + 1) })} aria-label="Add shelf">+</button></div></div>
-            <div className="row-control"><div><span className="control-label">{ui.doors}</span><small>Double hinged doors</small></div><button className={`toggle ${project.doors ? 'active' : ''}`} onClick={() => updateProject({ doors: !project.doors, doorOpen: false })} aria-pressed={project.doors} aria-label={ui.doors}><span /></button></div>
+            <div className="row-control"><div><span className="control-label">{ui.doors}</span><small>Double hinged doors</small></div><button className={`toggle ${project.doors ? 'active' : ''}`} onClick={() => updateProject(project.doors ? { doors: false, doorOpen: false, doorVariant: 'open' } : { doors: true, doorVariant: doorVariant === 'open' ? 'doubleHinged' : doorVariant })} aria-pressed={project.doors} aria-label={ui.doors}><span /></button></div>
             {project.doors && <div className="row-control"><div><span className="control-label">Door position</span><small>{project.doorOpen ? 'Open' : 'Closed'}</small></div><button className="text-button" onClick={() => updateProject({ doorOpen: !project.doorOpen })}><DoorOpen size={15} />{project.doorOpen ? 'Close' : 'Open'}</button></div>}
+          </section>
+          <section className="control-section">
+            <div className="section-heading"><Layers3 size={15} /><h2>{t('modulesDoors', 'Modules & Doors')}</h2></div>
+            <div className="row-control"><div><span className="control-label">{t('addModule', 'Add module')}</span><small>{t('addModuleHint', 'Interior fitting')}</small></div><button className="text-button" onClick={addModule} aria-label={t('addModule', 'Add module')}>+</button></div>
+            <div className="part-select"><span className="part-indicator" /><select value={pendingModule} onChange={(event) => setPendingModule(event.target.value as ModuleTypeId)} aria-label={t('addModule', 'Add module')}>{MODULE_CATALOG.map((entry) => <option key={entry.id} value={entry.id}>{entry.label}</option>)}</select><ChevronDown size={15} /></div>
+            {modules.map((entry) => {
+              const def = moduleDef(entry.type)
+              const selected = entry.id === selectedModuleId
+              return (
+                <div className="row-control" key={entry.id}>
+                  <div><span className="control-label">{selected ? `● ${def.label}` : def.label}</span><small>{def.hint}</small></div>
+                  <div style={{ display: 'flex', gap: 6 }}>
+                    <button className="text-button" onClick={() => setSelectedModuleId(selected ? null : entry.id)} aria-label={`Select ${def.label}`}>{selected ? 'Hide' : 'Show'}</button>
+                    <button className="text-button" onClick={() => removeModule(entry.id)} aria-label={`Remove ${def.label}`}>×</button>
+                  </div>
+                </div>
+              )
+            })}
+            {!modules.length && <p className="field-hint">{t('noModules', 'No modules yet — add one above to fit out the interior.')}</p>}
+            <div className="row-control"><div><span className="control-label">{t('doorVariant', 'Door variant')}</span><small>{t('doorVariantHint', 'Opening style')}</small></div></div>
+            <div className="part-select"><span className="part-indicator" /><select value={doorVariant} onChange={(event) => setDoorVariant(event.target.value as DoorVariantId)} aria-label={t('doorVariant', 'Door variant')}>{DOOR_VARIANTS.map((entry) => <option key={entry.id} value={entry.id}>{entry.label}</option>)}</select><ChevronDown size={15} /></div>
+            {doorNote && <p className="field-hint">{doorNote}</p>}
+            <div className="row-control"><div><span className="control-label">{t('handle', 'Handle')}</span><small>{t('handleHint', 'Opening hardware')}</small></div></div>
+            <div className="part-select"><span className="part-indicator" /><select value={project.handle ?? 'bar'} onChange={(event) => updateProject({ handle: event.target.value as HandleId })} aria-label={t('handle', 'Handle')}>{HANDLE_OPTIONS.map((entry) => <option key={entry.id} value={entry.id}>{entry.label}</option>)}</select><ChevronDown size={15} /></div>
           </section>
           <section className="control-section">
             <div className="section-heading"><Sparkles size={15} /><h2>{ui.finish}</h2></div>
@@ -383,9 +546,11 @@ function App() {
                 <button onClick={downloadProject}><Download size={15} />{ui.format}</button>
                 <button onClick={downloadDrawings}><Download size={15} />{ui.pdf}</button>
                 <button onClick={downloadCutList}><Ruler size={15} />{ui.csv}</button>
+                <button onClick={downloadHardware}><Ruler size={15} />Hardware · CSV</button>
                 <button onClick={downloadProduction}><Ruler size={15} />{ui.spec}</button>
               </div>}
             </div>
+            <button className="import-button" onClick={() => void copyShareLink()}>Copy Link</button>
             <div className="avatar">G</div>
           </div>
         </header>
@@ -399,8 +564,9 @@ function App() {
             <div className="view-hint">{ui.rotate}</div>
             <div className="view-tools"><button onClick={() => updateProject({ doorOpen: !project.doorOpen })} aria-label="Toggle doors"><DoorOpen size={17} /></button><button onClick={() => updateProject({ assembly: project.assembly >= 1 ? 0 : 1 })} aria-label="Toggle exploded view"><Layers3 size={17} /></button></div>
           </div>
+          <div className="timeline-card"><div className="timeline-heading"><div className="timeline-icon"><Ruler size={16} /></div><div><strong>{t('frontElevation', 'Front elevation · 2D')}</strong><small>{t('frontElevationHint', `${modules.length} modules · click a block to select`)}</small></div><button className="text-button" onClick={() => setPlanOpen(!planOpen)}>{planOpen ? t('hide', 'Hide') : t('show', 'Show')}</button></div>{planOpen && <Plan2D project={{ dimensions: project.dimensions, shelves: project.shelves, doors: project.doors }} modules={modules} doorVariant={doorVariant} selectedId={selectedModuleId} onSelect={setSelectedModuleId} />}</div>
           <div className="timeline-card"><div className="timeline-heading"><div className="timeline-icon"><Layers3 size={16} /></div><div><strong>{ui.assembled}</strong><small>{ui.assembly}</small></div><span className="timeline-time">{Math.round(project.assembly * 100)}%</span></div><input className="assembly-slider" type="range" min="0" max="1" step="0.01" value={project.assembly} onChange={(event) => updateProject({ assembly: Number(event.target.value) })} aria-label={ui.assembly} /><div className="timeline-labels"><span>{ui.assembled}</span><span>{ui.exploded}</span></div></div>
-          <div className={`design-check ${warnings.length ? 'has-warning' : ''}`}><div className="check-icon">{warnings.length ? <TriangleAlert size={16} /> : <Check size={16} />}</div><div><strong>{warnings.length ? ui.constraints : ui.valid}</strong><span>{warnings[0] ?? ui.support}</span></div><ChevronRight size={16} className="check-chevron" /></div>
+          <div className={`design-check ${warnings.length || moduleNotes.length ? 'has-warning' : ''}`}><div className="check-icon">{warnings.length || moduleNotes.length ? <TriangleAlert size={16} /> : <Check size={16} />}</div><div><strong>{warnings.length || moduleNotes.length ? ui.constraints : ui.valid}</strong><span>{warnings[0] ?? ui.support}</span>{moduleNotes[0] && <span title={moduleNotes.join('\n')}>{moduleNotes[0]}</span>}</div><ChevronRight size={16} className="check-chevron" /></div>
           <footer className="canvas-footer"><span><span className="footer-dot" />3D preview</span><span>W {project.dimensions.width} · H {project.dimensions.height} · D {project.dimensions.depth} mm</span></footer>
         </div>
       </section>
