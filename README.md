@@ -2,6 +2,10 @@
 
 A browser-based, parametric closet configurator built with React, TypeScript, Three.js, and React Three Fiber.
 
+## Product brief
+
+See [the product brief](docs/product-brief.md) for what we decided to build, the requested capabilities, the intended visual and interaction style, initial manufacturing assumptions, and how the current prototype compares with the broader product vision.
+
 ## Run locally
 
 ```sh
