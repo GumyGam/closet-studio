@@ -10,6 +10,7 @@
 //   Returns 0 with a TODO so production JSON is explicit instead of guessing.
 
 import type { ClosetProject } from '../closet'
+import type { ModuleInstance } from './modules'
 
 export type HardwareCounts = {
   handles: number
@@ -54,4 +55,91 @@ export function hardwareCsvRows(project: ClosetProject): Array<{ item: string; s
     { item: 'Hinge (soft-close 110deg)', sku: 'HINGE-110-SC', quantity: schedule.hinges },
     { item: 'Wardrobe rod', sku: 'ROD-CHROME', quantity: schedule.rods },
   ].filter((row) => row.quantity > 0)
+}
+
+// --- Module hardware (appended for the export-engine slice; old imports unchanged) ---
+
+/** Extra counts derived from interior modules (no door hardware here). */
+export type ModuleHardwareCounts = {
+  rods: number
+  slides: number
+  leds: number
+}
+
+/**
+ * Count hardware implied by interior modules (pure, deterministic).
+ * - rods: doubleHang 2, longHang 1, valetRod 1 (chrome rod + supports)
+ * - slides: 2 per drawer box — drawers3 6, drawersDeep 4 (2 deep boxes),
+ *   basket 2, trouserPullout 2 (side-mount pair each)
+ * - leds: 1 per ledStrip module (strip + driver share noted in schedule note)
+ * Unknown/other modules contribute 0.
+ */
+export function hardwareForModules(modules: readonly ModuleInstance[]): ModuleHardwareCounts {
+  let rods = 0
+  let slides = 0
+  let leds = 0
+  for (const module of modules) {
+    switch (module.type) {
+      case 'doubleHang':
+        rods += 2
+        break
+      case 'longHang':
+        rods += 1
+        break
+      case 'valetRod':
+        rods += 1
+        break
+      case 'drawers3':
+        slides += 6
+        break
+      case 'drawersDeep':
+        slides += 4
+        break
+      case 'basket':
+        slides += 2
+        break
+      case 'trouserPullout':
+        slides += 2
+        break
+      case 'ledStrip':
+        leds += 1
+        break
+      default:
+        break
+    }
+  }
+  return { rods, slides, leds }
+}
+
+/** Door counts (existing stub) merged with module counts. */
+export type FullHardwareSchedule = {
+  handles: number
+  hinges: number
+  rods: number
+  slides: number
+  leds: number
+  /** Human note for the carpenter / next slice. */
+  note: string
+}
+
+/**
+ * Full schedule: existing door counts + module rods/slides/leds.
+ * Backward compatible — `hardwareSchedule` above is untouched; old imports keep working.
+ * Pass [] (default) when the project has no modules.
+ */
+export function fullHardwareSchedule(
+  project: ClosetProject,
+  modules: readonly ModuleInstance[] = [],
+): FullHardwareSchedule {
+  const base = hardwareSchedule(project)
+  const extra = hardwareForModules(modules)
+  return {
+    handles: base.handles,
+    hinges: base.hinges,
+    rods: base.rods + extra.rods,
+    slides: extra.slides,
+    leds: extra.leds,
+    note:
+      'Door counts per hardwareSchedule stub + module rods/slides/led per catalog. Confirm SKU, soft-close, slide type, LED power before manufacture.',
+  }
 }

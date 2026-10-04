@@ -8,6 +8,7 @@ import type { ClosetProject, ClosetProjectPackage, PartId } from './closet'
 import { dimensionsForPart } from './lib/model'
 import { mmToM } from './lib/units'
 import { migrateHexToId, resolveFinish } from './lib/finishes'
+import { t } from './translations'
 import type { FinishId } from './lib/finishes'
 import { getCameraPreset } from './lib/cameraPresets'
 import type { CameraPresetName } from './lib/cameraPresets'
@@ -264,13 +265,13 @@ function DimensionLines({ project }: { project: ClosetProject }) {
         <lineBasicMaterial color="#8a847c" />
       </lineSegments>
       <Html position={labels.wPos} center style={{ pointerEvents: 'none' }}>
-        <div style={pill}>{project.dimensions.width} mm</div>
+        <div className="scene-dim-pill" style={pill}>{project.dimensions.width} mm</div>
       </Html>
       <Html position={labels.hPos} center style={{ pointerEvents: 'none' }}>
-        <div style={pill}>{project.dimensions.height} mm</div>
+        <div className="scene-dim-pill" style={pill}>{project.dimensions.height} mm</div>
       </Html>
       <Html position={labels.dPos} center style={{ pointerEvents: 'none' }}>
-        <div style={pill}>{project.dimensions.depth} mm</div>
+        <div className="scene-dim-pill" style={pill}>{project.dimensions.depth} mm</div>
       </Html>
     </group>
   )
@@ -358,7 +359,9 @@ export default function ClosetScene({ project, projectPackage, selectedPart, onS
           context.fillText(`W ${project.dimensions.width} mm     H ${project.dimensions.height} mm     D ${project.dimensions.depth} mm`, 24, output.height - 28)
           context.font = '14px sans-serif'
           context.fillStyle = '#71695f'
-          context.fillText(`Forme · ${project.finish} · ${project.shelves} shelves · ${project.doors ? 'doors' : 'no doors'}`, 24, 27)
+          const shelfWord = t(project.language, 'png.shelves', 'shelves')
+          const doorWord = project.doors ? t(project.language, 'png.doors', 'doors') : t(project.language, 'png.noDoors', 'no doors')
+          context.fillText(`Forme · ${migrateHexToId(project.finish)} · ${project.shelves} ${shelfWord} · ${doorWord}`, 24, 27)
           output.toBlob((blob) => {
             if (blob) downloadBlob(blob, 'closet-dimensions.png')
             else notifyExportError('Could not encode the dimensioned PNG image.')
@@ -424,9 +427,9 @@ export default function ClosetScene({ project, projectPackage, selectedPart, onS
         />
         <OrbitControls ref={controlsRef} makeDefault minDistance={2.2} maxDistance={8} maxPolarAngle={Math.PI / 2 + 0.08} />
       </Canvas>
-      <div style={{ position: 'absolute', top: 10, right: 10, display: 'flex', gap: 6 }}>
+      <div className="camera-preset-bar" style={{ position: 'absolute', top: 10, right: 10, display: 'flex', gap: 6 }}>
         {(['front', 'iso', 'top'] as const).map((name) => (
-          <button key={name} style={presetButton} onClick={() => applyPreset(name)} aria-label={`${name} camera view`}>
+          <button key={name} className="camera-preset-btn" style={presetButton} onClick={() => applyPreset(name)} aria-label={`${name} camera view`}>
             {name === 'front' ? 'Front' : name === 'iso' ? 'Iso' : 'Top'}
           </button>
         ))}
