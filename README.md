@@ -11,6 +11,10 @@ npm run dev
 
 Create a production build with `npm run build`.
 
+## GitHub Pages
+
+The app is published at <https://gumygam.github.io/closet-studio/> from the `gh-pages` branch. GitHub Pages automatically publishes that branch. To publish an updated build, run `npm run build`, copy the contents of `dist/` to the root of the `gh-pages` branch, commit, and push that branch. Vite is configured with the `/closet-studio/` project-site path.
+
 ## Project backup and restore
 
 The configurator saves the current project and up to 80 undo/redo snapshots in browser local storage. Use **Export → Editable JSON project** to make a portable backup, or **Export → 3D project · GLB** to download a binary glTF model with the same project package embedded as glTF metadata. On another browser or device, open the app and use **Open project** to import either `.json` or `.glb`; the current design, part overrides, material, display settings, assembly state, and saved editing history are restored.
